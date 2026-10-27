@@ -1,305 +1,233 @@
 import os
-import json
-import math
 import re
-from collections import Counter
+import io
+import traceback
 import streamlit as st
+import pandas as pd
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from groq import Groq
-from pypdf import PdfReader
-from docx import Document
 
-# ---------------------------------------------------------
-# Configuration & Constants
-# ---------------------------------------------------------
-STORE_FILE = "knowledge_base.json"
 MODEL_ID = "openai/gpt-oss-120b"
 
 st.set_page_config(
-    page_title="AI Style Humanizer",
-    page_icon="✍️",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="AI Office Suite (Excel & PowerPoint)",
+    page_icon="📑",
+    layout="wide"
 )
 
 # ---------------------------------------------------------
-# Pure-Python Vector & Similarity Engine (Zero C++ dependency)
+# Helper Functions
 # ---------------------------------------------------------
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"\b\w+\b", text.lower())
-
-def compute_tfidf_vector(tokens: list[str], idf: dict) -> dict:
-    tf = Counter(tokens)
-    total_tokens = len(tokens) or 1
-    vector = {}
-    for word, count in tf.items():
-        if word in idf:
-            vector[word] = (count / total_tokens) * idf[word]
-    return vector
-
-def cosine_similarity(v1: dict, v2: dict) -> float:
-    common = set(v1.keys()) & set(v2.keys())
-    if not common:
-        return 0.0
-    dot = sum(v1[k] * v2[k] for k in common)
-    norm1 = math.sqrt(sum(val ** 2 for val in v1.values()))
-    norm2 = math.sqrt(sum(val ** 2 for val in v2.values()))
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return dot / (norm1 * norm2)
-
-# ---------------------------------------------------------
-# Local Persistent Storage
-# ---------------------------------------------------------
-def load_knowledge_base() -> dict:
-    if os.path.exists(STORE_FILE):
-        try:
-            with open(STORE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {"chunks": [], "style_blueprint": ""}
-    return {"chunks": [], "style_blueprint": ""}
-
-def save_knowledge_base(data: dict):
-    with open(STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-def retrieve_top_chunks(query: str, chunks: list[str], top_k: int = 3) -> list[str]:
-    if not chunks:
-        return []
-    
-    tokenized_corpus = [tokenize(c) for c in chunks]
-    num_docs = len(tokenized_corpus)
-    
-    # Compute IDF
-    doc_freq = Counter()
-    for doc in tokenized_corpus:
-        doc_freq.update(set(doc))
-    
-    idf = {w: math.log((num_docs + 1) / (df + 1)) + 1 for w, df in doc_freq.items()}
-    
-    query_tokens = tokenize(query)
-    q_vec = compute_tfidf_vector(query_tokens, idf)
-    
-    scored = []
-    for i, doc_tokens in enumerate(tokenized_corpus):
-        d_vec = compute_tfidf_vector(doc_tokens, idf)
-        score = cosine_similarity(q_vec, d_vec)
-        scored.append((score, chunks[i]))
-        
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for score, c in scored[:top_k] if score > 0] or chunks[:top_k]
-
-# ---------------------------------------------------------
-# Document Parsers
-# ---------------------------------------------------------
-def extract_text(file) -> str:
-    name = file.name.lower()
-    text = ""
-    try:
-        if name.endswith(".txt"):
-            text = file.read().decode("utf-8", errors="ignore")
-        elif name.endswith(".pdf"):
-            reader = PdfReader(file)
-            for page in reader.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    text += extracted + "\n"
-        elif name.endswith(".docx"):
-            doc = Document(file)
-            text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    except Exception as e:
-        st.error(f"Error reading {file.name}: {e}")
+def extract_python_code(text: str) -> str:
+    """Extract code block if wrapped in markdown fences, or return raw string."""
+    pattern = r"```(?:python)?\s*(.*?)\s*```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        return matches[0].strip()
     return text.strip()
-
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
-    words = text.split()
-    if not words:
-        return []
-    chunks = []
-    i = 0
-    while i < len(words):
-        chunk = " ".join(words[i:i + chunk_size])
-        chunks.append(chunk)
-        i += max(1, chunk_size - overlap)
-    return chunks
-
-def extract_style_blueprint(groq_client: Groq, sample_texts: list[str]) -> str:
-    combined = "\n---\n".join(sample_texts[:5])
-    prompt = (
-        "Analyze these writing samples from a single writer. "
-        "Formulate a concise, bulleted 'Writer Persona & Style Guide'. "
-        "Detail:\n"
-        "1. Sentence structure, cadence, and typical length variations.\n"
-        "2. Vocabulary, phrase choices, transitions, and idioms.\n"
-        "3. Tone, formality, and rhetorical flow.\n\n"
-        f"WRITING SAMPLES:\n{combined[:4000]}\n\n"
-        "Provide only the crisp stylistic blueprint."
-    )
-    response = groq_client.chat.completions.create(
-        model=MODEL_ID,
-        messages=[
-            {"role": "system", "content": "You are an expert linguistic analyst."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=600,
-    )
-    return response.choices[0].message.content.strip()
 
 # ---------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------
-kb_data = load_knowledge_base()
-
 with st.sidebar:
-    st.title("⚙️ Knowledge Base")
-
+    st.title("⚙️ Workspace Setup")
     api_key = st.text_input(
         "Groq API Key",
         type="password",
         value=os.environ.get("GROQ_API_KEY", ""),
-        help="Enter your gsk_... key from console.groq.com"
+        help="Reads GROQ_API_KEY from Streamlit secrets or manual entry."
     )
-
+    
     st.markdown("---")
-    st.subheader("📚 Upload Writing Samples")
-    uploaded_files = st.file_uploader(
-        "Upload past writing (.txt, .pdf, .docx)",
-        type=["txt", "pdf", "docx"],
-        accept_multiple_files=True
+    mode = st.radio(
+        "Target Deliverable", 
+        ["PowerPoint Presentation (.pptx)", "Excel Workbook (.xlsx)"]
+    )
+    
+    st.markdown("---")
+    uploaded_file = st.file_uploader(
+        "Optional Reference Data (CSV/Excel)", 
+        type=["csv", "xlsx", "xls"],
+        help="Upload data if you want slides or sheets generated from existing numbers."
     )
 
-    col1, col2 = st.columns(2)
-    process_btn = col1.button("Ingest Samples", use_container_width=True)
-    clear_btn = col2.button("Clear Index", type="secondary", use_container_width=True)
+# ---------------------------------------------------------
+# Main Interface
+# ---------------------------------------------------------
+st.header("📑 AI Office Assistant: Excel & PowerPoint Builder")
+st.caption(f"Powered by `{MODEL_ID}` on Groq. Generates native, downloadable files.")
 
-    if clear_btn:
-        save_knowledge_base({"chunks": [], "style_blueprint": ""})
-        st.success("Knowledge base cleared.")
-        st.rerun()
+df = None
+schema_info = "No dataset uploaded. Build entirely from user prompt instructions."
 
-    if process_btn:
-        if not uploaded_files:
-            st.warning("Please upload at least one file first.")
+if uploaded_file:
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
         else:
-            with st.spinner("Indexing samples and analyzing style..."):
-                all_chunks = list(kb_data.get("chunks", []))
-                previews = []
+            df = pd.read_excel(uploaded_file)
+            
+        st.write("**Dataset Preview:**")
+        st.dataframe(df.head(3), use_container_width=True)
+        
+        buf = io.StringIO()
+        df.info(buf=buf)
+        schema_info = f"Columns & Types:\n{buf.getvalue()}\nSample Rows:\n{df.head(2).to_dict()}"
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
 
-                for f in uploaded_files:
-                    txt = extract_text(f)
-                    if txt:
-                        previews.append(txt[:1000])
-                        chunks = chunk_text(txt)
-                        all_chunks.extend(chunks)
+prompt_placeholder = (
+    "e.g., Create a 4-slide executive briefing on procurement compliance with key criteria and timelines."
+    if "PowerPoint" in mode
+    else "e.g., Create a clean budget sheet with revenue, operational expenses, totals, and formatted profit margins."
+)
 
-                blueprint = kb_data.get("style_blueprint", "")
-                if api_key and previews:
-                    try:
-                        client = Groq(api_key=api_key)
-                        blueprint = extract_style_blueprint(client, previews)
-                    except Exception as e:
-                        st.error(f"Groq error during style analysis: {e}")
+user_query = st.text_area("What do you want built?", placeholder=prompt_placeholder, height=100)
 
-                save_knowledge_base({
-                    "chunks": all_chunks,
-                    "style_blueprint": blueprint
-                })
-                st.success(f"Indexed {len(all_chunks)} total chunks successfully!")
-                st.rerun()
-
-    st.markdown("---")
-    st.subheader("📊 Profile Status")
-    st.write(f"**Stored Chunks:** {len(kb_data.get('chunks', []))}")
-    if kb_data.get("style_blueprint"):
-        with st.expander("View Active Style Blueprint"):
-            st.write(kb_data["style_blueprint"])
-    else:
-        st.info("Ingest samples with your API key to generate your style blueprint.")
-
-# ---------------------------------------------------------
-# Main Chat Interface
-# ---------------------------------------------------------
-st.header("✍️ AI Content Humanizer (Personalized RAG)")
-st.caption(f"Powered by `{MODEL_ID}` on Groq with vector-matched personal voice.")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "assistant" and "raw_text" in msg:
-            st.download_button(
-                label="📥 Download Rewrite (.txt)",
-                data=msg["raw_text"],
-                file_name="humanized_output.txt",
-                mime="text/plain",
-                key=msg["id"]
-            )
-
-if user_prompt := st.chat_input("Paste draft to rewrite in your authentic voice..."):
+if st.button("Generate File", type="primary", use_container_width=True):
     if not api_key:
-        st.error("Please enter your Groq API Key in the sidebar.")
+        st.error("Please provide your Groq API key in the sidebar.")
+        st.stop()
+    if not user_query.strip():
+        st.warning("Please provide instructions for what to create.")
         st.stop()
 
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
-
     groq_client = Groq(api_key=api_key)
-    
-    # RAG Retrieval
-    chunks = kb_data.get("chunks", [])
-    matched_chunks = retrieve_top_chunks(user_prompt, chunks, top_k=3)
-    ref_samples = "\n---\n".join(matched_chunks) if matched_chunks else "No uploaded writing samples found."
-    blueprint = kb_data.get("style_blueprint", "Write clearly, directly, and naturally without generic AI phrases.")
 
-    system_prompt = (
-        "You are an expert personal ghostwriter. Rewrite the user's text so that it mirrors "
-        "their exact personal writing voice, cadence, and sentence patterns, while retaining "
-        "100% of facts and original meaning.\n\n"
-        "DIRECTIVES:\n"
-        "- Eliminate generic AI tropes ('delve', 'tapestry', 'testament', 'revolutionize', 'in conclusion').\n"
-        "- Emulate the pacing, rhythm, and phrasing of the reference samples.\n"
-        "- Output ONLY the rewritten text without preambles.\n\n"
-        f"=== WRITER STYLE BLUEPRINT ===\n{blueprint}\n\n"
-        f"=== RETRIEVED VOICE SAMPLES ===\n{ref_samples}"
+    if "PowerPoint" in mode:
+        system_prompt = (
+            "You are an expert Python developer specialized in `python-pptx`.\n"
+            "Generate pure executable Python code that builds a PowerPoint presentation.\n\n"
+            "MANDATORY EXECUTION CONVENTIONS:\n"
+            "1. Available imports: `from pptx import Presentation`, `from pptx.util import Inches, Pt`, `from pptx.dml.color import RGBColor`.\n"
+            "2. Always start by creating the presentation object: `prs = Presentation()`.\n"
+            "3. TYPE SAFETY: Wrap all text assignments in `str(...)`.\n"
+            "4. Build multi-slide decks with clean layout, slide titles, subtitles, formatted bullets, or tables.\n"
+            "5. SAVING: You MUST end the script with this exact line:\n"
+            "   prs.save(output_buffer)\n"
+            "6. Output ONLY executable Python inside a ```python block. No introductory comments or explanations."
+        )
+    else:
+        system_prompt = (
+            "You are an expert Python developer specialized in `pandas` and `openpyxl`.\n"
+            "Generate pure executable Python code that builds or formats an Excel workbook.\n\n"
+            "MANDATORY EXECUTION CONVENTIONS:\n"
+            "1. Available imports: `import pandas as pd`, `import openpyxl`, `from openpyxl.styles import Font, PatternFill, Alignment, Border, Side`.\n"
+            "2. If `df` is provided, manipulate or enrich it. If creating from scratch, build a dataframe `result_df = pd.DataFrame(...)` or an openpyxl workbook `wb = openpyxl.Workbook()`.\n"
+            "3. SAVING: You MUST write the final data directly into `output_buffer` using ONE of these two exact patterns:\n"
+            "   Pattern A (Pandas):\n"
+            "       with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:\n"
+            "           result_df.to_excel(writer, index=False, sheet_name='Sheet1')\n"
+            "   Pattern B (Openpyxl Workbook):\n"
+            "       wb.save(output_buffer)\n"
+            "4. NEVER call writer.save() under any circumstances.\n"
+            "5. Output ONLY executable Python inside a ```python block. No introductory comments or explanations."
+        )
+
+    task_payload = (
+        f"AVAILABLE REFERENCE DATA:\n{schema_info}\n\n"
+        f"USER REQUEST: {user_query}\n\n"
+        "Generate the complete Python script to create and save the output into `output_buffer`."
     )
 
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        full_text = ""
+    with st.spinner("Writing and compiling your file with Groq..."):
         try:
-            stream = groq_client.chat.completions.create(
+            res = groq_client.chat.completions.create(
                 model=MODEL_ID,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Rewrite in my voice:\n\n{user_prompt}"}
+                    {"role": "user", "content": task_payload}
                 ],
-                temperature=0.6,
-                max_tokens=3000,
-                stream=True
+                temperature=0.1,
+                max_tokens=2500,
             )
-            for chunk in stream:
-                token = chunk.choices[0].delta.content or ""
-                full_text += token
-                placeholder.markdown(full_text + "▌")
-            placeholder.markdown(full_text)
+            code = extract_python_code(res.choices[0].message.content)
 
-            msg_id = f"msg_{len(st.session_state.messages)}"
-            st.download_button(
-                label="📥 Download Rewrite (.txt)",
-                data=full_text,
-                file_name="humanized_output.txt",
-                mime="text/plain",
-                key=msg_id
-            )
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": full_text,
-                "raw_text": full_text,
-                "id": msg_id
-            })
+            # Compatibility patch for legacy writer.save()
+            if not hasattr(pd.ExcelWriter, "save"):
+                pd.ExcelWriter.save = lambda self: self.close()
+
+            output_buffer = io.BytesIO()
+            exec_scope = {
+                "output_buffer": output_buffer,
+                "df": df,
+                "Presentation": Presentation,
+                "Inches": Inches,
+                "Pt": Pt,
+                "RGBColor": RGBColor,
+                "pd": pd,
+                "openpyxl": openpyxl,
+                "Font": Font,
+                "PatternFill": PatternFill,
+                "Alignment": Alignment,
+                "Border": Border,
+                "Side": Side
+            }
+
+            # Execute generated code
+            exec(code, {}, exec_scope)
+
+            # -------------------------------------------------------------
+            # Fallback Auto-Recovery: Intercept if output_buffer is empty
+            # -------------------------------------------------------------
+            file_bytes = output_buffer.getvalue()
+
+            if len(file_bytes) == 0:
+                # 1. Did the code define an openpyxl workbook `wb` or `workbook`?
+                for var_name in ["wb", "workbook"]:
+                    if var_name in exec_scope and hasattr(exec_scope[var_name], "save"):
+                        exec_scope[var_name].save(output_buffer)
+                        file_bytes = output_buffer.getvalue()
+                        break
+
+                # 2. Did the code define a PowerPoint presentation `prs` or `presentation`?
+                if len(file_bytes) == 0:
+                    for var_name in ["prs", "presentation"]:
+                        if var_name in exec_scope and hasattr(exec_scope[var_name], "save"):
+                            exec_scope[var_name].save(output_buffer)
+                            file_bytes = output_buffer.getvalue()
+                            break
+
+                # 3. Did the code create a new DataFrame `result_df` or update `df`?
+                if len(file_bytes) == 0 and "Excel" in mode:
+                    target_df = exec_scope.get("result_df", exec_scope.get("df", None))
+                    if isinstance(target_df, pd.DataFrame):
+                        with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+                            target_df.to_excel(writer, index=False)
+                        file_bytes = output_buffer.getvalue()
+
+            # Final validation
+            if len(file_bytes) == 0:
+                st.error("Output buffer was empty. Here is the generated code for inspection:")
+                st.code(code, language="python")
+            else:
+                st.success(f"File created successfully! ({len(file_bytes):,} bytes)")
+
+                if "PowerPoint" in mode:
+                    st.download_button(
+                        label="📥 Download Presentation (.pptx)",
+                        data=file_bytes,
+                        file_name="generated_presentation.pptx",
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True
+                    )
+                else:
+                    st.download_button(
+                        label="📥 Download Workbook (.xlsx)",
+                        data=file_bytes,
+                        file_name="generated_sheet.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+                with st.expander("View Generated Automation Code"):
+                    st.code(code, language="python")
+
         except Exception as e:
-            st.error(f"Groq API Error: {e}")
+            st.error(f"Execution Error: {e}")
+            with st.expander("Show Traceback Details"):
+                st.code(traceback.format_exc(), language="python")
